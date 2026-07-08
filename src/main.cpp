@@ -21,6 +21,7 @@ FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
 IN THE SOFTWARE.
 ****************************************************************************
 Revisions:
+3.0.1   ZAW
 2.1.0:  ZAW_01: PTT sequencer
 1.1.0:  Make "Robust UnShift On Space" transmission to be compatible with MMTTY's 
         non-USOS default receiver.  It is effectively non-USOS transmission 
@@ -456,9 +457,16 @@ void loop()
         // so that we can pick it up at the top of this loop.  If we 
         // didn't do this, we would like continue on, see the buffer 
         //is empty, and transmit a diddle before the first real character.
-        pttViaPin = false; // OK2ZAW: this TX was triggered over serial
-        endWhenBufferEmpty = false;
-        setPTT(true);
+        // Only one source may control PTT at a time--ignore this if a
+        // transmission is already underway (e.g. started via the PTT
+        // input pin). Calling setPTT(true) again mid-transmission would
+        // splice a ~230ms PA/PTT lead-in glitch into the FSK bitstream.
+        if (!ptt)
+        {
+          pttViaPin = false; // OK2ZAW: this TX was triggered over serial
+          endWhenBufferEmpty = false;
+          setPTT(true);
+        }
         return; //return to beginning of loop to pick up first char if any
       }
       else if  (b == TX_END)
@@ -957,13 +965,26 @@ void pollPttInput()
     pttInputActive = active;
     if (active)
     {
-      pttViaPin = true;
-      endWhenBufferEmpty = false; // same as TX_ON
-      setPTT(true);
+      // Only one source may control PTT at a time--ignore the pin if a
+      // transmission is already underway (e.g. started over serial).
+      // Calling setPTT(true) again mid-transmission would splice a
+      // ~230ms PA/PTT lead-in glitch into the FSK bitstream.
+      if (!ptt)
+      {
+        pttViaPin = true;
+        endWhenBufferEmpty = false; // same as TX_ON
+        setPTT(true);
+      }
     }
     else
     {
-      endWhenBufferEmpty = true; // same as TX_END
+      // Only end the session if the pin actually started it--otherwise
+      // this is just a stray release while serial/PC owns the current
+      // transmission, and should have no effect on it.
+      if (pttViaPin)
+      {
+        endWhenBufferEmpty = true; // same as TX_END
+      }
     }
   }
 }
