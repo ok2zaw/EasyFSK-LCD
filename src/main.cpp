@@ -322,6 +322,9 @@ byte currentShiftState = SHIFT_UNKNOWN;  //Keeps track of Letter/Figs state to d
                                          //if we need to send shift chars
                                          
 boolean ptt = false; // Keeps track of PTT state (true = Transmitter is on)
+boolean pttViaPin = false; // OK2ZAW: true if current/most recent TX was triggered
+                           // by PTT_INPUT_PIN rather than the serial '[' command;
+                           // shown on the LCD status line.
 
 volatile boolean isrFlag = false;   //set by timer interrupt.  Set high every 1/2 bit
                                     //to indicate when we should exectute the bit-banging
@@ -453,10 +456,11 @@ void loop()
         // so that we can pick it up at the top of this loop.  If we 
         // didn't do this, we would like continue on, see the buffer 
         //is empty, and transmit a diddle before the first real character.
-        endWhenBufferEmpty = false; 
+        pttViaPin = false; // OK2ZAW: this TX was triggered over serial
+        endWhenBufferEmpty = false;
         setPTT(true);
         return; //return to beginning of loop to pick up first char if any
-      } 
+      }
       else if  (b == TX_END)
       {
         endWhenBufferEmpty = true;
@@ -953,6 +957,7 @@ void pollPttInput()
     pttInputActive = active;
     if (active)
     {
+      pttViaPin = true;
       endWhenBufferEmpty = false; // same as TX_ON
       setPTT(true);
     }
@@ -978,16 +983,23 @@ void echo(byte b)
 }
 
 /**
-* Refreshes the LCD's first line with the current TX/RX state,
-* baud rate, and FSK polarity.
+* Refreshes the LCD's first line: "EasyFSK <baud> RX/TX" normally, or
+* "EasyFSK USB TX" while transmitting if PTT was triggered by
+* PTT_INPUT_PIN rather than the serial '[' command.
 */
 void updateLcdStatus()
 {
   char line1[LCD_COLS + 1];
-  const char* state = ptt ? "TX" : "RX";
   const char* baudLabel = (baudrate == 50.0) ? "50" : (baudrate == 75.0) ? "75" : "45.45";
-  const char* pol = (mark == LOW) ? "MLo" : "MHi";
-  snprintf(line1, sizeof(line1), "%s %s %s", state, baudLabel, pol);
+
+  if (ptt && pttViaPin)
+  {
+    snprintf(line1, sizeof(line1), "EasyFSK USB TX");
+  }
+  else
+  {
+    snprintf(line1, sizeof(line1), "EasyFSK %s %s", baudLabel, ptt ? "TX" : "RX");
+  }
 
   lcd.setCursor(0, 0);
   lcd.print(line1);
