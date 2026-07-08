@@ -56,6 +56,13 @@ Revisions:
 #define PTT_INPUT_PIN 2
 #define PTT_INPUT_DEBOUNCE_MS 20
 
+//External PTT inhibit input.  Active LOW--pulled up internally, so an
+//unconnected/open pin reads HIGH (not inhibited).  Only checked at the
+//moment PTT would be activated (via '[' or PTT_INPUT_PIN); has no effect
+//on a transmission already in progress.
+#define INHIBIT_PIN 3
+#define INHIBIT_DEBOUNCE_MS 20
+
 //1602 LCD connected via PCF8574 I2C backpack.
 //Wiring: VCC->5V, GND->GND, SDA->A4, SCL->A5 (Arduino Nano hardware I2C pins).
 #define LCD_I2C_ADDR 0x27
@@ -350,6 +357,11 @@ boolean pttInputActive = false;        //last debounced/accepted state
 boolean pttInputRawLast = HIGH;        //last raw pin reading (HIGH = idle)
 unsigned long pttInputChangeMillis = 0;
 
+// Debounce state for the external PTT inhibit input pin.
+boolean inhibitActive = false;         //last debounced/accepted state (true = inhibited)
+boolean inhibitRawLast = HIGH;         //last raw pin reading (HIGH = not inhibited)
+unsigned long inhibitChangeMillis = 0;
+
 /*******************************************************
 Forward declarations.  PlatformIO does not auto-generate
 prototypes for .cpp files (unlike the Arduino IDE with .ino
@@ -374,6 +386,7 @@ void echo(byte b);
 void updateLcdStatus();
 void lcdEcho(byte b);
 void pollPttInput();
+void pollInhibitPin();
 
 /*********************************************************************
 Main execution
@@ -399,6 +412,7 @@ void setup()
   pinMode(PTT_PA_PIN, OUTPUT); // OK2ZAW
   pinMode(ON_PIN, OUTPUT); // OK2ZAW
   pinMode(PTT_INPUT_PIN, INPUT_PULLUP); // OK2ZAW: external PTT input
+  pinMode(INHIBIT_PIN, INPUT_PULLUP); // OK2ZAW: external PTT inhibit input
   lcd.init();
   lcd.backlight();
   eeLoad();
@@ -461,7 +475,9 @@ void loop()
         // transmission is already underway (e.g. started via the PTT
         // input pin). Calling setPTT(true) again mid-transmission would
         // splice a ~230ms PA/PTT lead-in glitch into the FSK bitstream.
-        if (!ptt)
+        // INHIBIT_PIN is only checked here, at the moment of activation--
+        // it has no effect once a transmission is already running.
+        if (!ptt && !inhibitActive)
         {
           pttViaPin = false; // OK2ZAW: this TX was triggered over serial
           endWhenBufferEmpty = false;
@@ -484,7 +500,10 @@ void loop()
       }
     }
   }
-  // (2) check the external PTT input pin--has the same effect as '[' / ']'
+  // (2) check the external PTT inhibit pin first, so pollPttInput() below
+  // sees the current inhibit state before deciding whether to key.
+  pollInhibitPin();
+  // (2b) check the external PTT input pin--has the same effect as '[' / ']'
   // arriving over serial.
   pollPttInput();
   // (3) if the ISR fired we need may need to bit-bang something out the the FSK port
@@ -969,7 +988,9 @@ void pollPttInput()
       // transmission is already underway (e.g. started over serial).
       // Calling setPTT(true) again mid-transmission would splice a
       // ~230ms PA/PTT lead-in glitch into the FSK bitstream.
-      if (!ptt)
+      // INHIBIT_PIN is only checked here, at the moment of activation--
+      // it has no effect once a transmission is already running.
+      if (!ptt && !inhibitActive)
       {
         pttViaPin = true;
         endWhenBufferEmpty = false; // same as TX_ON
@@ -990,6 +1011,39 @@ void pollPttInput()
 }
 
 /**
+* Polls the external PTT inhibit pin (debounced).  Only maintains the
+* inhibitActive flag consulted at PTT-activation time, and refreshes the
+* LCD (while idle) so "PTT INHIBIT !" is visible as soon as the pin goes
+* active--it does not touch PTT itself.
+*/
+void pollInhibitPin()
+{
+  boolean raw = digitalRead(INHIBIT_PIN);
+
+  if (raw != inhibitRawLast)
+  {
+    inhibitRawLast = raw;
+    inhibitChangeMillis = millis();
+    return;
+  }
+
+  if ((millis() - inhibitChangeMillis) < INHIBIT_DEBOUNCE_MS)
+  {
+    return;
+  }
+
+  boolean active = (raw == LOW);
+  if (active != inhibitActive)
+  {
+    inhibitActive = active;
+    if (!ptt)
+    {
+      updateLcdStatus(); // reflect the change on the LCD while idle
+    }
+  }
+}
+
+/**
 * Echo to the serial port.  This will show up in the user's terminal
 * if he or she is watching.
 */
@@ -1004,7 +1058,8 @@ void echo(byte b)
 }
 
 /**
-* Refreshes the LCD's first line: "EasyFSK <baud> RX/TX" normally, or
+* Refreshes the LCD's first line: "PTT INHIBIT !" while idle if
+* INHIBIT_PIN is active; otherwise "EasyFSK <baud> RX/TX" normally, or
 * "EasyFSK USB TX" while transmitting if PTT was triggered by
 * PTT_INPUT_PIN rather than the serial '[' command.
 */
@@ -1013,7 +1068,11 @@ void updateLcdStatus()
   char line1[LCD_COLS + 1];
   const char* baudLabel = (baudrate == 50.0) ? "50" : (baudrate == 75.0) ? "75" : "45.45";
 
-  if (ptt && pttViaPin)
+  if (!ptt && inhibitActive)
+  {
+    snprintf(line1, sizeof(line1), "PTT INHIBIT !");
+  }
+  else if (ptt && pttViaPin)
   {
     snprintf(line1, sizeof(line1), "EasyFSK USB TX");
   }
