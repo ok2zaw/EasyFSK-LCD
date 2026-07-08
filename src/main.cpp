@@ -37,6 +37,8 @@ Revisions:
 
 #include "TimerOne.h"
 #include "EEPROM.h"
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
 
 #define VERSION "2.1.0 - OK2ZAW mods."
 
@@ -45,6 +47,19 @@ Revisions:
 #define PTT_PIN 13
 #define PTT_PA_PIN 10
 #define ON_PIN 8
+
+//External PTT input (e.g. TNC or footswitch).  Active LOW--pulled up
+//internally, so an unconnected/open pin reads HIGH (idle).  Has exactly
+//the same effect as the '[' / ']' serial commands: asserting it starts TX
+//(like '['), releasing it lets the buffer finish then drops PTT (like ']').
+#define PTT_INPUT_PIN 2
+#define PTT_INPUT_DEBOUNCE_MS 20
+
+//1602 LCD connected via PCF8574 I2C backpack.
+//Wiring: VCC->5V, GND->GND, SDA->A4, SCL->A5 (Arduino Nano hardware I2C pins).
+#define LCD_I2C_ADDR 0x27
+#define LCD_COLS 16
+#define LCD_ROWS 2
 
 //EEPROM addresses to persist configuration
 #define EE_SPEED_ADDR 0
@@ -315,6 +330,22 @@ volatile boolean isrFlag = false;   //set by timer interrupt.  Set high every 1/
 boolean configurationMode = false;  //flag indicates if we are in the menu system or
                                     //in normal operation.
 
+LiquidCrystal_I2C lcd(LCD_I2C_ADDR, LCD_COLS, LCD_ROWS);
+char lcdLine2[LCD_COLS + 1] = "                ";  //rolling ticker of last chars sent
+
+// The LCD is written over I2C, which blocks for ~1-2ms per character.
+// That's too slow to call directly from the FSK bit-banging path (it would
+// delay the FSK_PIN transition for the current bit), so echo() just queues
+// the character here and loop() flushes it to the LCD right after the
+// current half-bit has already been serviced.
+boolean lcdCharPending = false;
+byte lcdPendingChar = 0;
+
+// Debounce state for the external PTT input pin.
+boolean pttInputActive = false;        //last debounced/accepted state
+boolean pttInputRawLast = HIGH;        //last raw pin reading (HIGH = idle)
+unsigned long pttInputChangeMillis = 0;
+
 /*******************************************************
 Forward declarations.  PlatformIO does not auto-generate
 prototypes for .cpp files (unlike the Arduino IDE with .ino
@@ -336,6 +367,9 @@ boolean requiresLetters(byte asciiByte);
 boolean requiresFigures(byte asciiByte);
 void setPTT(byte b);
 void echo(byte b);
+void updateLcdStatus();
+void lcdEcho(byte b);
+void pollPttInput();
 
 /*********************************************************************
 Main execution
@@ -360,8 +394,12 @@ void setup()
   pinMode(PTT_PIN, OUTPUT);
   pinMode(PTT_PA_PIN, OUTPUT); // OK2ZAW
   pinMode(ON_PIN, OUTPUT); // OK2ZAW
+  pinMode(PTT_INPUT_PIN, INPUT_PULLUP); // OK2ZAW: external PTT input
+  lcd.init();
+  lcd.backlight();
   eeLoad();
-  displayConfiguration(); 
+  displayConfiguration();
+  updateLcdStatus();
   // start the half-bit timer.
   initTimer();
   
@@ -434,11 +472,24 @@ void loop()
       }
     }
   }
-  // (2) if the ISR fired we need may need to bit-bang something out the the FSK port
-  if (isrFlag) 
+  // (2) check the external PTT input pin--has the same effect as '[' / ']'
+  // arriving over serial.
+  pollPttInput();
+  // (3) if the ISR fired we need may need to bit-bang something out the the FSK port
+  if (isrFlag)
   {
     processHalfBit();
     isrFlag = false;
+  }
+  // (4) flush any queued LCD ticker update.  Done here (after the current
+  // half-bit has already been serviced) so the blocking I2C write never
+  // delays the FSK_PIN transition itself--only, at worst, the servicing of
+  // the *next* tick, which has a multi-millisecond margin at all supported
+  // baud rates.
+  if (lcdCharPending)
+  {
+    lcdCharPending = false;
+    lcdEcho(lcdPendingChar);
   }
 }
 
@@ -494,8 +545,9 @@ void handleConfigurationCommand(byte b)
       {
         Serial.write("\nNot a recognized command. Exiting configuration mode.\n");
       } 
-    }  
+    }
     displayConfiguration();
+    updateLcdStatus();
     configurationMode = false;
 }
 
@@ -835,9 +887,12 @@ boolean requiresFigures(byte asciiByte)
 /**
 * Turns the PTT on or off and applies any delays that might exist.
 */
-void setPTT(byte b) 
+void setPTT(byte b)
 {
-  
+  // Set the flag up front (nothing above uses it), so updateLcdStatus()
+  // below already reports the correct TX/RX state.
+  ptt = b;
+
   if (b)
   {  // PTT ON
     digitalWrite(PTT_PA_PIN, HIGH); // OK2ZAW mod PTT sequencer
@@ -847,13 +902,17 @@ void setPTT(byte b)
     // we will stay in the mark state for some amount of time
     // before sending the first start bit of the first character
     delay(pttLeadMillis);
+    // Do the (slow, blocking) LCD write only now that PTT/FSK are already
+    // asserted--it just extends the harmless pre-data mark hold above
+    // instead of delaying the actual PTT_PA_PIN/PTT_PIN key-up.
+    updateLcdStatus();
   }
-  else 
+  else
   {  // PTT OFF
     digitalWrite(PTT_PA_PIN, LOW); // OK2ZAW mod PTT sequencer
     delay (ptt_PA_TailMillis);
     digitalWrite(PTT_PIN, LOW); // drop PTT
-    digitalWrite(FSK_PIN, space); 
+    digitalWrite(FSK_PIN, space);
     delay (pttTailMillis);
     stopBitCounter = 0;
     bitPos = -1;
@@ -861,8 +920,47 @@ void setPTT(byte b)
 
     lastAsciiByteSent = 0;
     Serial.write("\ncmd:\n"); // Tells N1MM that TX is finished
+    updateLcdStatus(); // safe: transmission has already ended
   }
-   ptt = b;
+}
+
+/**
+* Polls the external PTT input pin (debounced) and gives it exactly the
+* same effect as the '[' / ']' serial commands: active = start TX (like
+* TX_ON), inactive = let the buffer finish then drop PTT (like TX_END).
+* Debounced in software using millis() so no delay() is needed here--this
+* runs every pass of loop() alongside the timing-critical bit banger.
+*/
+void pollPttInput()
+{
+  boolean raw = digitalRead(PTT_INPUT_PIN);
+
+  if (raw != pttInputRawLast)
+  {
+    pttInputRawLast = raw;
+    pttInputChangeMillis = millis();
+    return;
+  }
+
+  if ((millis() - pttInputChangeMillis) < PTT_INPUT_DEBOUNCE_MS)
+  {
+    return;
+  }
+
+  boolean active = (raw == LOW);
+  if (active != pttInputActive)
+  {
+    pttInputActive = active;
+    if (active)
+    {
+      endWhenBufferEmpty = false; // same as TX_ON
+      setPTT(true);
+    }
+    else
+    {
+      endWhenBufferEmpty = true; // same as TX_END
+    }
+  }
 }
 
 /**
@@ -872,6 +970,44 @@ void setPTT(byte b)
 void echo(byte b)
 {
   Serial.write(b);
+  // Don't touch the LCD here directly--this runs inside processHalfBit()'s
+  // getNextSendChar() call, *before* the FSK_PIN is toggled for the new
+  // character's start bit. Queue it instead; loop() flushes it afterwards.
+  lcdPendingChar = b;
+  lcdCharPending = true;
+}
+
+/**
+* Refreshes the LCD's first line with the current TX/RX state,
+* baud rate, and FSK polarity.
+*/
+void updateLcdStatus()
+{
+  char line1[LCD_COLS + 1];
+  const char* state = ptt ? "TX" : "RX";
+  const char* baudLabel = (baudrate == 50.0) ? "50" : (baudrate == 75.0) ? "75" : "45.45";
+  const char* pol = (mark == LOW) ? "MLo" : "MHi";
+  snprintf(line1, sizeof(line1), "%s %s %s", state, baudLabel, pol);
+
+  lcd.setCursor(0, 0);
+  lcd.print(line1);
+  for (byte i = strlen(line1); i < LCD_COLS; i++)
+  {
+    lcd.print(' ');
+  }
+}
+
+/**
+* Scrolls a newly sent ASCII character into the LCD's second line,
+* mirroring the serial echo.  Non-printable characters show as a space.
+*/
+void lcdEcho(byte b)
+{
+  char c = (b >= 32 && b <= 126) ? (char) b : ' ';
+  memmove(lcdLine2, lcdLine2 + 1, LCD_COLS - 1);
+  lcdLine2[LCD_COLS - 1] = c;
+  lcd.setCursor(0, 1);
+  lcd.print(lcdLine2);
 }
 
 
