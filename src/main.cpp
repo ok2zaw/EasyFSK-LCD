@@ -49,6 +49,10 @@ Revisions:
 #define PTT_PA_PIN 10
 #define ON_PIN 8
 
+//RX indicator LED--simple inverse of PTT: on while receiving, off while
+//transmitting.
+#define RX_LED_PIN 4
+
 //External PTT input (e.g. TNC or footswitch).  Active LOW--pulled up
 //internally, so an unconnected/open pin reads HIGH (idle).  Has exactly
 //the same effect as the '[' / ']' serial commands: asserting it starts TX
@@ -411,6 +415,7 @@ void setup()
   pinMode(PTT_PIN, OUTPUT);
   pinMode(PTT_PA_PIN, OUTPUT); // OK2ZAW
   pinMode(ON_PIN, OUTPUT); // OK2ZAW
+  pinMode(RX_LED_PIN, OUTPUT); // OK2ZAW: RX indicator LED
   pinMode(PTT_INPUT_PIN, INPUT_PULLUP); // OK2ZAW: external PTT input
   pinMode(INHIBIT_PIN, INPUT_PULLUP); // OK2ZAW: external PTT inhibit input
   lcd.init();
@@ -424,6 +429,7 @@ void setup()
   Serial.write("\ncmd:\n"); // Tell N1MM we are in "RX" mode.  This will be sent
                             // at the end of transmission.
   digitalWrite(PTT_PIN, LOW);
+  digitalWrite(RX_LED_PIN, HIGH); // idle at boot = RX
 }
 
 
@@ -923,6 +929,7 @@ void setPTT(byte b)
   // Set the flag up front (nothing above uses it), so updateLcdStatus()
   // below already reports the correct TX/RX state.
   ptt = b;
+  digitalWrite(RX_LED_PIN, b ? LOW : HIGH); // RX LED is simply the inverse of PTT
 
   if (b)
   {  // PTT ON
